@@ -2,14 +2,15 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
+	"fmt"
 	"hash/fnv"
 	"io/ioutil"
-	"log"
 	"os"
 	"path"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -31,6 +32,10 @@ type jobPhase string
 const (
 	mapPhase    jobPhase = "mapPhase"
 	reducePhase          = "reducePhase"
+)
+
+var (
+	kvSplitChar = "+"
 )
 
 type task struct {
@@ -86,33 +91,57 @@ func (c *MRCluster) worker() {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				content, err := ioutil.ReadFile(t.mapFile)
-				if err != nil {
-					panic(err)
-				}
-
+				// 准备文件的读写对象
 				fs := make([]*os.File, t.nReduce)
 				bs := make([]*bufio.Writer, t.nReduce)
 				for i := range fs {
-					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
-					fs[i], bs[i] = CreateFileAndBuf(rpath)
+					fs[i], bs[i] = CreateFileAndBuf(reduceName(t.dataDir, t.jobName, t.taskNumber, i))
 				}
-				results := t.mapF(t.mapFile, string(content))
+				// 从文件读取数据并执行mapF()，将mapF()的结果存储到对应的文件中
+				content, err := ioutil.ReadFile(t.mapFile)
+				PanicErr(err)
+				results := t.mapF(t.mapFile, BytesToString(content))
+				// 用map存储不同key设置唯一一个ihash()值，减少ihash()的调用
+				bsIndexMap := make(map[string]int)
 				for _, kv := range results {
-					enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-					if err := enc.Encode(&kv); err != nil {
-						log.Fatalln(err)
+					if _, ok := bsIndexMap[kv.Key]; !ok {
+						bsIndexMap[kv.Key] = ihash(kv.Key) % t.nReduce
 					}
+					fmt.Fprintf(bs[bsIndexMap[kv.Key]], "%s\n", kv.Key+kvSplitChar+kv.Value)
 				}
+				// 关闭文件读写对象
 				for i := range fs {
 					SafeClose(fs[i], bs[i])
 				}
 			} else {
-				// YOUR CODE HERE :)
-				// hint: don't encode results returned by ReduceF, and just output
-				// them into the destination file directly so that users can get
-				// results formatted as what they want.
-				panic("YOUR CODE HERE")
+				mergeFileName := mergeName(t.dataDir, t.jobName, t.taskNumber)
+				fs, bs := CreateFileAndBuf(mergeFileName)
+				var kvMap = make(map[string][]string, t.nMap)
+				// shuffle处理
+				for index := 0; index < t.nMap; index++ {
+					fileName := reduceName(t.dataDir, t.jobName, index, t.taskNumber)
+					content, err := ioutil.ReadFile(fileName)
+					PanicErr(err)
+					bytesLines := bytes.Split(content, []byte("\n"))
+					for _, bytesLine := range bytesLines {
+						if len(bytesLine) == 0 || len(bytesLine) == len(kvSplitChar) {
+							continue
+						}
+						kvSlice := strings.Split(BytesToString(bytesLine), kvSplitChar)
+						if len(kvSlice) <= 1 {
+							continue
+						}
+						kvMap[kvSlice[0]] = append(kvMap[kvSlice[0]], kvSlice[1])
+					}
+				}
+				// 写入文件
+				buffer := make([]string, 0, len(kvMap))
+				for key, values := range kvMap {
+					buffer = append(buffer, t.reduceF(key, values))
+				}
+				_, err := bs.WriteString(strings.Join(buffer, ""))
+				PanicErr(err)
+				SafeClose(fs, bs)
 			}
 			t.wg.Done()
 		case <-c.exit:
@@ -156,10 +185,31 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	for _, t := range tasks {
 		t.wg.Wait()
 	}
-
+	
 	// reduce phase
-	// YOUR CODE HERE :D
-	panic("YOUR CODE HERE")
+	tasks = make([]*task, 0, nReduce)
+	for index := 0; index < nReduce; index++ {
+		t := &task{
+			dataDir:    dataDir,
+			jobName:    jobName,
+			phase:      reducePhase,
+			taskNumber: index,
+			nReduce:    nReduce,
+			nMap:       nMap,
+			reduceF:    reduceF,
+		}
+		t.wg.Add(1)
+		tasks = append(tasks, t)
+		go func() { c.taskCh <- t }()
+	}
+	notifies := make([]string, 0, nReduce)
+	for _, t := range tasks {
+		t.wg.Wait()
+		mergedFileName := mergeName(t.dataDir, t.jobName, t.taskNumber)
+		notifies = append(notifies, mergedFileName)
+	}
+	
+	notify <- notifies
 }
 
 func ihash(s string) int {

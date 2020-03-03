@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"runtime/pprof"
 	"testing"
 	"time"
 )
@@ -56,6 +57,17 @@ func testURLTop(t *testing.T, rounds RoundsArgs) {
 	if len(rounds) == 0 {
 		t.Fatalf("no rounds arguments, please finish your code")
 	}
+	cpuProfilePath := "cpu.prof"
+	
+	cpuProfFile, err := os.Create(cpuProfilePath)
+	if err != nil {
+		log.Fatalln("Create cpu profile file failed, filepath:", cpuProfilePath)
+	}
+	if err := pprof.StartCPUProfile(cpuProfFile); err != nil {
+		log.Fatalln("Start CPU profile failed:", err)
+	}
+	defer pprof.StopCPUProfile()
+	
 	mr := GetMRCluster()
 
 	// run all cases
